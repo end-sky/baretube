@@ -23,11 +23,12 @@ type Theme struct {
 }
 
 type Config struct {
-	Backend      string            `json:"backend"` // "local" or "invidious"
-	InvidiousURL string            `json:"invidious_url"`
-	Theme        string            `json:"theme"`
-	Themes       map[string]Theme  `json:"themes,omitempty"`
-	Keybinds     map[string]string `json:"keybinds,omitempty"` // key -> action
+	Backend            string            `json:"backend"` // "local" or "invidious"
+	InvidiousURL       string            `json:"invidious_url"`
+	SoundCloudClientID string            `json:"soundcloud_client_id,omitempty"`
+	Theme              string            `json:"theme"`
+	Themes             map[string]Theme  `json:"themes,omitempty"`
+	Keybinds           map[string]string `json:"keybinds,omitempty"` // key -> action
 }
 
 type ActionHandler func(*App)
@@ -70,6 +71,7 @@ func init() {
 	RegisterKeybind("ctrl+s", "search")
 	RegisterKeybind("ctrl+q", "quit")
 	RegisterKeybind("ctrl+c", "quit")
+	RegisterKeybind("ctrl+p", "switch_source")
 	RegisterKeybind("tab", "next_view")
 	RegisterKeybind("/", "search")
 	RegisterKeybind("r", "refresh")
@@ -121,6 +123,9 @@ func LoadConfig() (Config, string, error) {
 		cfg.InvidiousURL = DefaultConfig().InvidiousURL
 	}
 	cfg.InvidiousURL = strings.TrimRight(strings.TrimSpace(cfg.InvidiousURL), "/")
+	if cfg.SoundCloudClientID == "" {
+		cfg.SoundCloudClientID = strings.TrimSpace(os.Getenv("JABBERWOCK_SC_CLIENT_ID"))
+	}
 	if cfg.Themes == nil {
 		cfg.Themes = map[string]Theme{}
 	}

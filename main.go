@@ -1,8 +1,9 @@
-// jabberwock is a tiny terminal YouTube search client. It uses only the Go
-// standard library; mpv (and usually yt-dlp) is used for playback.
+// jabberwock is a tiny terminal YouTube and SoundCloud client. It uses only
+// the Go standard library; mpv and optionally cava handle playback/visuals.
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -12,7 +13,10 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
 	"unsafe"
+
+	"jabberwock/soundcloud"
 )
 
 const (
@@ -24,24 +28,28 @@ const (
 var viewNames = []string{"Home", "Filters", "Settings"}
 
 type App struct {
-	cfg        Config
-	cfgPath    string
-	filters    Filters
-	query      string
-	videos     []Video
-	selected   int
-	page       int
-	cursor     SearchCursor
-	hasMore    bool
-	view       int
-	filterRow  int
-	settingRow int
-	inputMode  string // "search" or "instance"
-	input      []rune
-	notice     string
-	fatalErr   error
-	quit       bool
-	term       terminal
+	cfg            Config
+	cfgPath        string
+	filters        Filters
+	query          string
+	videos         []Video
+	selected       int
+	page           int
+	cursor         SearchCursor
+	hasMore        bool
+	view           int
+	filterRow      int
+	settingRow     int
+	inputMode      string // "search" or "instance"
+	input          []rune
+	notice         string
+	fatalErr       error
+	quit           bool
+	term           terminal
+	provider       string // "youtube" or "soundcloud"
+	sourcePicker   bool
+	sourceSelected int
+	scClient       soundcloud.Client
 }
 
 type terminal struct {
@@ -65,7 +73,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "jabberwock:", err)
 		os.Exit(1)
 	}
-	app := &App{cfg: cfg, cfgPath: cfgPath, filters: DefaultFilters(), view: viewVideos, notice: "Tab switches Home / Filters / Settings; arrow keys navigate the current section."}
+	app := &App{cfg: cfg, cfgPath: cfgPath, filters: DefaultFilters(), view: viewVideos, sourcePicker: true, scClient: soundcloud.Client{ClientID: cfg.SoundCloudClientID}, notice: "Choose YouTube or SoundCloud with ↑/↓, then press Enter."}
 	app.term = terminal{fd: int(os.Stdin.Fd())}
 	if err := app.term.enable(); err != nil {
 		fmt.Fprintln(os.Stderr, "jabberwock: cannot enter terminal mode:", err)
@@ -82,7 +90,7 @@ func main() {
 }
 
 func printHelp() {
-	fmt.Println(`jabberwock — tiny terminal YouTube client
+	fmt.Println(`jabberwock — tiny terminal YouTube + SoundCloud client
 
 Run: go run .
 Build: go build -o jabberwock .
@@ -91,8 +99,11 @@ Requires an interactive terminal. Playback is delegated to mpv; for YouTube
 URLs, mpv generally needs yt-dlp installed as well. No Go modules are required.
 Settings: ~/.config/jabberwock/config.json (or $JABBERWOCK_CONFIG).
 
-The local backend scrapes YouTube search HTML. The Invidious backend uses its
-public /api/v1/search endpoint. No history or subscriptions are stored.`)
+At startup, choose YouTube or SoundCloud. Ctrl+P opens that chooser again.
+YouTube uses HTML scraping or the Invidious API. SoundCloud discovers its public
+client ID and filters blocked/Go-only tracks. If discovery fails, set
+soundcloud_client_id in config.json or JABBERWOCK_SC_CLIENT_ID. SoundCloud playback
+uses mpv; CAVA is optional for terminal audio visuals. No history or subscriptions are stored.`)
 }
 
 func isTerminal(file *os.File) bool {
@@ -224,6 +235,10 @@ func (a *App) handleKey(key string) {
 	if key == "" {
 		return
 	}
+	if a.sourcePicker {
+		a.handleSourcePickerKey(key)
+		return
+	}
 	if a.inputMode != "" {
 		a.handleInputKey(key)
 		return
@@ -252,11 +267,15 @@ func (a *App) handleKey(key string) {
 			}
 		}
 	case viewFilters:
+		filterCount := len(filterOptions)
+		if a.provider == "soundcloud" {
+			filterCount = 3
+		}
 		switch key {
 		case "up", "k":
-			a.filterRow = (a.filterRow + len(filterOptions) - 1) % len(filterOptions)
+			a.filterRow = (a.filterRow + filterCount - 1) % filterCount
 		case "down", "j":
-			a.filterRow = (a.filterRow + 1) % len(filterOptions)
+			a.filterRow = (a.filterRow + 1) % filterCount
 		case "left":
 			a.cycleFilter(-1)
 		case "right", "enter":
@@ -265,13 +284,43 @@ func (a *App) handleKey(key string) {
 	case viewSettings:
 		switch key {
 		case "up", "k":
-			a.settingRow = (a.settingRow + 2) % 3
+			a.settingRow = (a.settingRow + 3) % 4
 		case "down", "j":
-			a.settingRow = (a.settingRow + 1) % 3
+			a.settingRow = (a.settingRow + 1) % 4
 		case "left":
 			a.cycleSetting(-1)
 		case "right", "enter":
 			a.cycleSetting(1)
+		}
+	}
+}
+
+func (a *App) handleSourcePickerKey(key string) {
+	switch key {
+	case "up", "down", "left", "right":
+		a.sourceSelected = 1 - a.sourceSelected
+	case "enter":
+		if a.sourceSelected == 1 {
+			a.provider = "soundcloud"
+			a.notice = "SoundCloud selected. Ctrl+S searches tracks; Enter plays audio."
+		} else {
+			a.provider = "youtube"
+			a.notice = "YouTube selected. Ctrl+S searches videos; Enter plays with mpv."
+		}
+		a.sourcePicker = false
+		if a.provider == "soundcloud" && a.filterRow > 2 {
+			a.filterRow = 2
+		}
+		a.query = ""
+		a.videos = nil
+		a.selected = 0
+		a.cursor = SearchCursor{}
+		a.hasMore = false
+	case "ctrl+q", "ctrl+c":
+		a.quit = true
+	case "esc":
+		if a.provider != "" {
+			a.sourcePicker = false
 		}
 	}
 }
@@ -284,6 +333,12 @@ func (a *App) dispatchAction(action string) {
 		a.quit = true
 	case "next_view":
 		a.view = (a.view + 1) % len(viewNames)
+	case "switch_source":
+		a.sourceSelected = 0
+		if a.provider == "soundcloud" {
+			a.sourceSelected = 1
+		}
+		a.sourcePicker = true
 	case "refresh":
 		if strings.TrimSpace(a.query) == "" {
 			a.notice = "Search first with Ctrl+S."
@@ -313,8 +368,13 @@ func (a *App) beginInput(mode string) {
 	if mode == "instance" {
 		a.input = []rune(a.cfg.InvidiousURL)
 	}
+	if mode == "sc_client_id" {
+		a.input = []rune(a.cfg.SoundCloudClientID)
+	}
 	if mode == "search" {
 		a.notice = "Type a query and press Enter; Esc cancels."
+	} else if mode == "sc_client_id" {
+		a.notice = "Set a SoundCloud client ID, or clear it to auto-detect; press Enter."
 	} else {
 		a.notice = "Edit the Invidious base URL, then press Enter."
 	}
@@ -338,6 +398,10 @@ func (a *App) handleInputKey(key string) {
 			a.view = viewVideos
 			a.selected = 0
 			a.performSearch()
+		} else if mode == "sc_client_id" {
+			a.cfg.SoundCloudClientID = value
+			a.scClient.ClientID = value
+			a.saveConfig("SoundCloud client ID updated; empty means auto-detect.")
 		} else if mode == "instance" {
 			if !strings.HasPrefix(value, "https://") && !strings.HasPrefix(value, "http://") {
 				a.notice = "URL must start with https:// or http://. Setting was not changed."
@@ -422,8 +486,8 @@ func (a *App) cycleSetting(direction int) {
 		} else {
 			a.cfg.Backend = "local"
 		}
-		a.saveConfig("Backend changed to " + a.cfg.Backend + ".")
-		if a.query != "" {
+		a.saveConfig("YouTube backend changed to " + a.cfg.Backend + ".")
+		if a.query != "" && a.provider != "soundcloud" {
 			a.performSearch()
 		}
 	case 1:
@@ -449,6 +513,8 @@ func (a *App) cycleSetting(direction int) {
 		}
 		a.cfg.Theme = names[pos]
 		a.saveConfig("Theme changed to " + a.cfg.Theme + ".")
+	case 3:
+		a.beginInput("sc_client_id")
 	}
 }
 
@@ -482,6 +548,10 @@ func (a *App) loadNextPage() {
 }
 
 func (a *App) fetchSearchPage(next bool) {
+	if a.provider == "soundcloud" {
+		a.fetchSoundCloudPage(next)
+		return
+	}
 	page := 1
 	cursor := SearchCursor{}
 	if next {
@@ -539,6 +609,75 @@ func (a *App) fetchSearchPage(next bool) {
 	a.notice = fmt.Sprintf("Found %d videos on page 1.%s", len(a.videos), nextPageNotice(a.hasMore))
 }
 
+func (a *App) fetchSoundCloudPage(next bool) {
+	offset := 0
+	nextURL := ""
+	if next {
+		offset = a.cursor.SoundCloudOffset
+		nextURL = a.cursor.SoundCloudNextURL
+		a.notice = fmt.Sprintf("Loading SoundCloud page %d…", a.page+1)
+	} else {
+		a.notice = "Searching SoundCloud tracks…"
+	}
+	a.render()
+	ctx, cancel := context.WithTimeout(context.Background(), 28*time.Second)
+	defer cancel()
+	if a.scClient.ClientID != a.cfg.SoundCloudClientID {
+		a.scClient.ClientID = a.cfg.SoundCloudClientID
+	}
+	result, err := a.scClient.Search(ctx, a.query, offset, 20, nextURL)
+	if err != nil {
+		a.notice = "SoundCloud search failed: " + err.Error()
+		if !next {
+			a.videos = nil
+			a.selected = 0
+			a.hasMore = false
+			a.cursor = SearchCursor{}
+		}
+		return
+	}
+	pageVideos := make([]Video, 0, len(result.Tracks))
+	for _, track := range result.Tracks {
+		v := Video{
+			Title: track.Title, Author: track.Username, VideoID: "sc:" + track.ID,
+			WatchURL: track.PermalinkURL, StreamURL: track.StreamURL, IsTrack: true,
+			DurationSeconds: track.DurationMS / 1000, DurationKnown: track.DurationMS > 0,
+			Views: track.PlaybackCount, ViewsKnown: track.PlaybackCountKnown,
+			Published: track.CreatedAt, PublishedKnown: !track.CreatedAt.IsZero(), PublishedText: track.CreatedAtText,
+		}
+		pageVideos = append(pageVideos, v)
+	}
+	if next {
+		previousCount := len(a.videos)
+		a.videos = appendUniqueVideos(a.videos, pageVideos)
+		a.videos = FilterAndSort(a.videos, a.filters)
+		a.page++
+		a.cursor = SearchCursor{SoundCloudOffset: result.NextOffset, SoundCloudNextURL: result.NextURL}
+		a.hasMore = result.HasMore
+		if len(a.videos) > previousCount {
+			a.selected = min(previousCount, len(a.videos)-1)
+			a.notice = fmt.Sprintf("Loaded %d more playable tracks (page %d).", len(a.videos)-previousCount, a.page)
+		} else if a.hasMore {
+			a.selected = len(a.videos)
+			a.notice = "No playable tracks on this page matched. Press Enter on Next page to continue."
+		} else {
+			a.selected = max(0, len(a.videos)-1)
+			a.notice = "You've reached the end of playable SoundCloud tracks."
+		}
+		return
+	}
+	a.page = 1
+	a.videos = FilterAndSort(pageVideos, a.filters)
+	a.cursor = SearchCursor{SoundCloudOffset: result.NextOffset, SoundCloudNextURL: result.NextURL}
+	a.hasMore = result.HasMore
+	a.selected = 0
+	if len(a.videos) == 0 && !a.hasMore {
+		a.notice = "No playable SoundCloud tracks matched. Go and SoundCloud-only tracks are hidden by default."
+		return
+	}
+	a.notice = fmt.Sprintf("Found %d playable tracks on page 1.%s", len(a.videos), nextPageNotice(a.hasMore))
+}
+
 func nextPageNotice(hasMore bool) string {
 	if hasMore {
 		return " Select Next page at the bottom for more."
@@ -576,6 +715,10 @@ func (a *App) playSelected() {
 		return
 	}
 	video := a.videos[a.selected]
+	if video.IsTrack {
+		a.playSoundCloudTrack(video)
+		return
+	}
 	if _, err := exec.LookPath("mpv"); err != nil {
 		a.notice = "mpv not found. Install mpv to watch videos."
 		return
@@ -599,7 +742,134 @@ func (a *App) playSelected() {
 	}
 }
 
+func (a *App) playSoundCloudTrack(track Video) {
+	if strings.TrimSpace(track.StreamURL) == "" {
+		a.notice = "This SoundCloud track has no supported playable stream. It may be DRM-protected or SoundCloud Go-only."
+		return
+	}
+	if _, err := exec.LookPath("mpv"); err != nil {
+		a.notice = "mpv not found. Install mpv to play SoundCloud audio."
+		return
+	}
+
+	// SoundCloud's media.transcodings URL is an API endpoint, not usually the
+	// actual audio file. Resolve it to a signed CDN URL/playlist before giving
+	// it to mpv. This is also required for current AAC/HLS streams.
+	a.notice = "Resolving SoundCloud audio stream…"
+	a.render()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	streamURL, err := a.scClient.ResolveStreamURL(ctx, track.StreamURL)
+	cancel()
+	if err != nil {
+		a.notice = "SoundCloud stream resolution failed: " + err.Error()
+		return
+	}
+
+	cavaPath, cavaErr := exec.LookPath("cava")
+	a.term.restore()
+	fmt.Print("\x1b[0m\x1b[?25h\x1b[2J\x1b[H")
+	if cavaErr != nil {
+		fmt.Printf("jabberwock: playing SoundCloud audio (install cava for terminal visuals)\r\n\r\n")
+		if err := runPlainSoundCloud(streamURL); err != nil {
+			a.notice = "mpv playback failed: " + err.Error()
+		} else {
+			a.notice = "Playback finished."
+		}
+	} else {
+		fmt.Printf("jabberwock: %s — %s\r\nCAVA will show audio levels; press Ctrl+C to stop playback.\r\n\r\n", track.Title, track.Author)
+		var mpvLog bytes.Buffer
+		mpv := exec.Command("mpv", "--no-video", "--force-window=no", "--no-terminal", "--msg-level=all=warn", "--", streamURL)
+		mpv.Stdin = nil
+		mpv.Stdout, mpv.Stderr = &mpvLog, &mpvLog
+		if err := mpv.Start(); err != nil {
+			a.notice = "Could not start mpv: " + err.Error()
+		} else {
+			mpvDone := make(chan error, 1)
+			go func() { mpvDone <- mpv.Wait() }()
+			select {
+			case playErr := <-mpvDone:
+				// mpv can fail immediately when a stream URL expires or has an
+				// unsupported format. Do not leave CAVA running without audio.
+				if playErr != nil {
+					fmt.Print("mpv could not play this SoundCloud stream:\r\n")
+					if mpvLog.Len() > 0 {
+						fmt.Print(mpvLog.String(), "\r\n")
+					}
+					a.notice = "mpv playback failed: " + playErr.Error()
+				} else {
+					a.notice = "Playback finished."
+				}
+			case <-time.After(350 * time.Millisecond):
+				cava := exec.Command(cavaPath)
+				cava.Stdin, cava.Stdout, cava.Stderr = os.Stdin, os.Stdout, os.Stderr
+				if err := cava.Start(); err != nil {
+					if mpv.Process != nil {
+						_ = mpv.Process.Kill()
+					}
+					<-mpvDone
+					fmt.Printf("CAVA could not start (%v); falling back to plain audio playback.\r\n\r\n", err)
+					if playErr := runPlainSoundCloud(streamURL); playErr != nil {
+						a.notice = "mpv playback failed: " + playErr.Error()
+					} else {
+						a.notice = "Playback finished."
+					}
+				} else {
+					cavaDone := make(chan error, 1)
+					go func() { cavaDone <- cava.Wait() }()
+					select {
+					case playErr := <-mpvDone:
+						if cava.Process != nil {
+							_ = cava.Process.Kill()
+						}
+						<-cavaDone
+						if playErr != nil {
+							fmt.Print("mpv could not play this SoundCloud stream:\r\n")
+							if mpvLog.Len() > 0 {
+								fmt.Print(mpvLog.String(), "\r\n")
+							}
+							a.notice = "mpv playback failed: " + playErr.Error()
+						} else {
+							a.notice = "Playback finished."
+						}
+					case cavaErr := <-cavaDone:
+						if mpv.Process != nil {
+							_ = mpv.Process.Kill()
+						}
+						<-mpvDone
+						if cavaErr != nil {
+							fmt.Printf("\r\nCAVA failed (%v); falling back to plain audio playback.\r\n\r\n", cavaErr)
+							if playErr := runPlainSoundCloud(streamURL); playErr != nil {
+								a.notice = "mpv playback failed: " + playErr.Error()
+							} else {
+								a.notice = "Playback finished."
+							}
+						} else {
+							a.notice = "SoundCloud playback stopped."
+						}
+					}
+				}
+			}
+		}
+	}
+	fmt.Print("\r\nReturning to jabberwock…\r\n")
+	if enableErr := a.term.enable(); enableErr != nil {
+		a.quit = true
+		a.fatalErr = enableErr
+		return
+	}
+}
+
+func runPlainSoundCloud(streamURL string) error {
+	cmd := exec.Command("mpv", "--no-video", "--force-window=no", "--", streamURL)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd.Run()
+}
+
 func (a *App) render() {
+	if a.sourcePicker {
+		a.renderSourcePicker()
+		return
+	}
 	width, height := terminalSize()
 	if width < 48 {
 		width = 48
@@ -624,10 +894,14 @@ func (a *App) render() {
 	}
 	lines := make([]string, 0, height)
 	backendLabel := "LOCAL SCRAPE"
-	if a.cfg.Backend == "invidious" {
+	productLabel := "YouTube TUI"
+	if a.provider == "soundcloud" {
+		backendLabel = "SOUNDCLOUD TRACKS"
+		productLabel = "YouTube + SoundCloud TUI"
+	} else if a.cfg.Backend == "invidious" {
 		backendLabel = "INVIDIOUS API"
 	}
-	lines = append(lines, "  "+paint(theme.Title, "JABBERWOCK")+"  "+paint(theme.Muted, "minimal YouTube TUI")+"  "+paint(theme.Accent, backendLabel))
+	lines = append(lines, "  "+paint(theme.Title, "JABBERWOCK")+"  "+paint(theme.Muted, "minimal "+productLabel)+"  "+paint(theme.Accent, backendLabel))
 	var tabs []string
 	for i, name := range viewNames {
 		if i == a.view {
@@ -642,14 +916,24 @@ func (a *App) render() {
 	switch a.view {
 	case viewVideos:
 		if a.query == "" {
-			lines = append(lines, "  Welcome to jabberwock — a lightweight YouTube search and player.")
-			lines = append(lines, "  TAB switches sections: Home → Filters → Settings (then wraps around).")
-			lines = append(lines, "  ↑/↓ move through results or rows; ←/→ change the selected filter or setting.")
-			lines = append(lines, "  Ctrl+S searches; Enter plays a video in mpv. At the end, select Next page.")
+			if a.provider == "soundcloud" {
+				lines = append(lines, "  Welcome to jabberwock SoundCloud mode — search, filter, and play tracks.")
+				lines = append(lines, "  Ctrl+S searches tracks; Enter plays with mpv, optionally alongside CAVA visuals.")
+				lines = append(lines, "  Only playable progressive tracks are listed. Go / subscriber-only and blocked tracks are hidden.")
+			} else {
+				lines = append(lines, "  Welcome to jabberwock YouTube mode — search, filter, and watch videos.")
+				lines = append(lines, "  Ctrl+S searches; Enter plays a video in mpv. At the end, select Next page.")
+			}
+			lines = append(lines, "  Tab switches Home / Filters / Settings; ↑/↓ navigate results and rows inside a section.")
+			lines = append(lines, "  ←/→ change the selected filter or setting. Press Ctrl+P to switch source.")
 			lines = append(lines, "  No watch history or local subscriptions are stored.")
 		} else {
 			lines = append(lines, "  Query: "+clip(a.query))
-			lines = append(lines, "  Filters: sort="+a.filters.Sort+"  uploaded="+a.filters.Date+"  duration="+a.filters.Duration+"  hide-shorts="+onOff(a.filters.HideShorts))
+			if a.provider == "soundcloud" {
+				lines = append(lines, "  Filters: sort="+a.filters.Sort+"  uploaded="+a.filters.Date+"  duration="+a.filters.Duration+"  playable tracks only")
+			} else {
+				lines = append(lines, "  Filters: sort="+a.filters.Sort+"  uploaded="+a.filters.Date+"  duration="+a.filters.Duration+"  hide-shorts="+onOff(a.filters.HideShorts))
+			}
 			lines = append(lines, "")
 			available := height - 10
 			if available < 1 {
@@ -704,7 +988,11 @@ func (a *App) render() {
 	case viewFilters:
 		lines = append(lines, "  Select a row with ↑/↓. Press Enter (or →) to cycle; ← cycles backwards.")
 		lines = append(lines, "")
-		for i, option := range filterOptions {
+		options := filterOptions
+		if a.provider == "soundcloud" {
+			options = filterOptions[:3]
+		}
+		for i, option := range options {
 			row := fmt.Sprintf("  %-14s  %s", option.Name, a.filters.labelAt(i))
 			if i == a.filterRow {
 				lines = append(lines, paint(theme.Selected, clip("› "+row)))
@@ -713,7 +1001,11 @@ func (a *App) render() {
 			}
 		}
 		lines = append(lines, "")
-		lines = append(lines, paint(theme.Muted, "  No Shorts: Shorts-marked results are hidden. Older Invidious instances may not label every Short."))
+		if a.provider == "soundcloud" {
+			lines = append(lines, paint(theme.Muted, "  SoundCloud search returns tracks only; blocked, preview-only, Go/subscriber-only, and non-progressive tracks are hidden."))
+		} else {
+			lines = append(lines, paint(theme.Muted, "  No Shorts: Shorts-marked results are hidden. Older Invidious instances may not label every Short."))
+		}
 	case viewSettings:
 		lines = append(lines, "  Settings are saved to: "+clip(a.cfgPath))
 		lines = append(lines, "  Select with ↑/↓; Enter or → changes the selected setting.")
@@ -722,10 +1014,15 @@ func (a *App) render() {
 		if a.cfg.Backend == "invidious" {
 			backend = "Invidious API"
 		}
+		scID := "Auto-detect"
+		if a.cfg.SoundCloudClientID != "" {
+			scID = a.cfg.SoundCloudClientID
+		}
 		settings := []string{
-			"Backend           " + backend,
+			"YouTube backend    " + backend,
 			"Invidious base URL " + a.cfg.InvidiousURL,
-			"Theme             " + a.cfg.Theme,
+			"Theme              " + a.cfg.Theme,
+			"SoundCloud client ID " + scID,
 		}
 		for i, setting := range settings {
 			row := clip("  " + setting)
@@ -737,7 +1034,8 @@ func (a *App) render() {
 		}
 		lines = append(lines, "")
 		lines = append(lines, paint(theme.Muted, "  Themes: add ANSI SGR palette entries in config.json, or call RegisterTheme in config.go."))
-		lines = append(lines, paint(theme.Muted, "  Keybinds: key -> action in config.json; Go forks can add custom RegisterAction callbacks."))
+		lines = append(lines, paint(theme.Muted, "  Keybinds: key -> action in config.json; Ctrl+P opens the source picker."))
+		lines = append(lines, paint(theme.Muted, "  SoundCloud client ID: auto-detected from web assets or edit it here if discovery fails."))
 	}
 
 	for len(lines) < height-3 {
@@ -748,13 +1046,15 @@ func (a *App) render() {
 		prompt := "Search> "
 		if a.inputMode == "instance" {
 			prompt = "Invidious URL> "
+		} else if a.inputMode == "sc_client_id" {
+			prompt = "SoundCloud client ID> "
 		}
 		lines = append(lines, paint(theme.Accent, "  "+prompt)+clip(string(a.input))+"█")
 	} else {
 		lines = append(lines, paint(theme.Muted, "  Tab: sections  ↑/↓: items  ←/→: options  Ctrl+S: search  Enter: select/play  Ctrl+Q: quit"))
 	}
 	statusCode := theme.Muted
-	if strings.HasPrefix(a.notice, "Search failed:") || strings.HasPrefix(a.notice, "Could not") || strings.Contains(a.notice, "not found") {
+	if strings.HasPrefix(a.notice, "Search failed:") || strings.HasPrefix(a.notice, "SoundCloud search failed:") || strings.HasPrefix(a.notice, "Could not") || strings.Contains(a.notice, "not found") {
 		statusCode = theme.Error
 	}
 	status := "  " + a.notice
@@ -774,6 +1074,47 @@ func (a *App) render() {
 	}
 }
 
+func (a *App) renderSourcePicker() {
+	width, height := terminalSize()
+	if width < 48 {
+		width = 48
+	}
+	if height < 12 {
+		height = 12
+	}
+	theme := a.cfg.selectedTheme()
+	paint := func(code, value string) string {
+		if code == "" {
+			return value
+		}
+		return "\x1b[" + code + "m" + value + "\x1b[0m"
+	}
+	lines := []string{
+		"  " + paint(theme.Title, "JABBERWOCK") + "  " + paint(theme.Muted, "lightweight terminal media client"),
+		"  " + strings.Repeat("─", width-4),
+		"",
+		"  Choose a source to open:",
+		"",
+	}
+	choices := []string{"YouTube", "SoundCloud"}
+	for i, choice := range choices {
+		row := "    " + choice
+		if i == a.sourceSelected {
+			lines = append(lines, paint(theme.Selected, "  › "+row))
+		} else {
+			lines = append(lines, paint(theme.Text, "    "+row))
+		}
+	}
+	lines = append(lines, "", paint(theme.Muted, "  ↑/↓ choose, Enter open, Ctrl+Q quit"), paint(theme.Muted, "  YouTube: HTML scrape or Invidious. SoundCloud: playable tracks only."), paint(theme.Muted, "  Tab switches Home / Filters / Settings; arrows move inside a section."))
+	for len(lines) < height-2 {
+		lines = append(lines, "")
+	}
+	fmt.Print("\x1b[?25l\x1b[H\x1b[2J")
+	for _, line := range lines {
+		fmt.Print(line, "\r\n")
+	}
+}
+
 func terminalSize() (int, int) {
 	var size struct {
 		Row    uint16
@@ -790,6 +1131,9 @@ func terminalSize() (int, int) {
 
 func formatDuration(video Video) string {
 	if !video.DurationKnown {
+		if video.IsTrack {
+			return "--:--"
+		}
 		return "LIVE"
 	}
 	seconds := video.DurationSeconds
