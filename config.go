@@ -27,6 +27,7 @@ type Config struct {
 	InvidiousURL       string            `json:"invidious_url"`
 	SoundCloudClientID string            `json:"soundcloud_client_id,omitempty"`
 	Theme              string            `json:"theme"`
+	SoundCloudTheme    string            `json:"soundcloud_theme,omitempty"`
 	Themes             map[string]Theme  `json:"themes,omitempty"`
 	Keybinds           map[string]string `json:"keybinds,omitempty"` // key -> action
 }
@@ -67,6 +68,7 @@ func init() {
 	RegisterTheme(Theme{Name: "wock", Title: "1;36", Accent: "36", Text: "37", Muted: "90", Selected: "1;30;46", Error: "1;31", Border: "34"})
 	RegisterTheme(Theme{Name: "paper", Title: "1;34", Accent: "35", Text: "30", Muted: "90", Selected: "1;37;44", Error: "1;31", Border: "94"})
 	RegisterTheme(Theme{Name: "moss", Title: "1;32", Accent: "32", Text: "37", Muted: "90", Selected: "1;30;42", Error: "1;31", Border: "32"})
+	RegisterTheme(Theme{Name: "soundcloud", Title: "1;38;5;208", Accent: "38;5;208", Text: "37", Muted: "90", Selected: "1;30;48;5;208", Error: "1;31", Border: "38;5;166"})
 
 	RegisterKeybind("ctrl+s", "search")
 	RegisterKeybind("ctrl+q", "quit")
@@ -81,11 +83,12 @@ func init() {
 
 func DefaultConfig() Config {
 	return Config{
-		Backend:      "local",
-		InvidiousURL: "https://yewtu.be",
-		Theme:        "wock",
-		Themes:       map[string]Theme{},
-		Keybinds:     map[string]string{},
+		Backend:         "local",
+		InvidiousURL:    "https://yewtu.be",
+		Theme:           "wock",
+		SoundCloudTheme: "soundcloud",
+		Themes:          map[string]Theme{},
+		Keybinds:        map[string]string{},
 	}
 }
 
@@ -125,6 +128,9 @@ func LoadConfig() (Config, string, error) {
 	cfg.InvidiousURL = strings.TrimRight(strings.TrimSpace(cfg.InvidiousURL), "/")
 	if cfg.SoundCloudClientID == "" {
 		cfg.SoundCloudClientID = strings.TrimSpace(os.Getenv("JABBERWOCK_SC_CLIENT_ID"))
+	}
+	if strings.TrimSpace(cfg.SoundCloudTheme) == "" {
+		cfg.SoundCloudTheme = "soundcloud"
 	}
 	if cfg.Themes == nil {
 		cfg.Themes = map[string]Theme{}
@@ -181,6 +187,26 @@ func (cfg Config) selectedTheme() Theme {
 		return t
 	}
 	return registeredThemes["wock"]
+}
+
+// selectedThemeFor keeps separate theme preferences for YouTube and SoundCloud.
+// Existing `theme` settings continue to control YouTube; SoundCloud defaults to
+// its orange-accent theme but remains customizable through the Settings screen.
+func (cfg Config) selectedThemeFor(provider string) Theme {
+	name := cfg.Theme
+	if provider == "soundcloud" {
+		name = cfg.SoundCloudTheme
+	}
+	if t, ok := cfg.Themes[name]; ok {
+		if t.Name == "" {
+			t.Name = name
+		}
+		return t
+	}
+	if t, ok := registeredThemes[name]; ok {
+		return t
+	}
+	return cfg.selectedTheme()
 }
 
 func (cfg Config) effectiveKeybinds() map[string]string {

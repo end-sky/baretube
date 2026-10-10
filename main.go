@@ -53,9 +53,10 @@ type App struct {
 }
 
 type terminal struct {
-	fd       int
-	original syscall.Termios
-	active   bool
+	fd            int
+	original      syscall.Termios
+	active        bool
+	playbackInput bool
 }
 
 func main() {
@@ -103,7 +104,9 @@ At startup, choose YouTube or SoundCloud. Ctrl+P opens that chooser again.
 YouTube uses HTML scraping or the Invidious API. SoundCloud discovers its public
 client ID and filters blocked/Go-only tracks. If discovery fails, set
 soundcloud_client_id in config.json or JABBERWOCK_SC_CLIENT_ID. SoundCloud playback
-uses mpv; CAVA is optional for terminal audio visuals. No history or subscriptions are stored.`)
+uses mpv; CAVA is optional for terminal audio visuals. Press Esc during either kind
+of playback to stop the media processes and return to the previous page. No history
+or subscriptions are stored.`)
 }
 
 func isTerminal(file *os.File) bool {
@@ -112,15 +115,7 @@ func isTerminal(file *os.File) bool {
 	return errno == 0
 }
 
-func (t *terminal) enable() error {
-	if t.active {
-		return nil
-	}
-	var original syscall.Termios
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(t.fd), uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&original)))
-	if errno != 0 {
-		return errno
-	}
+func rawTerminal(original syscall.Termios) syscall.Termios {
 	raw := original
 	raw.Iflag &^= syscall.BRKINT | syscall.ICRNL | syscall.INPCK | syscall.ISTRIP | syscall.IXON
 	raw.Oflag &^= syscall.OPOST
@@ -128,6 +123,22 @@ func (t *terminal) enable() error {
 	raw.Cflag |= syscall.CS8
 	raw.Cc[syscall.VMIN] = 0
 	raw.Cc[syscall.VTIME] = 1 // a 100ms timeout also lets us recognize a lone Esc
+	return raw
+}
+
+func (t *terminal) enable() error {
+	if t.active {
+		return nil
+	}
+	if t.playbackInput {
+		t.restorePlaybackInput()
+	}
+	var original syscall.Termios
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(t.fd), uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&original)))
+	if errno != 0 {
+		return errno
+	}
+	raw := rawTerminal(original)
 	_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, uintptr(t.fd), uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&raw)))
 	if errno != 0 {
 		return errno
@@ -138,7 +149,39 @@ func (t *terminal) enable() error {
 	return nil
 }
 
+// enablePlaybackInput keeps terminal input raw so Esc can be detected while an
+// external player owns the visible screen. Unlike enable(), it does not enter
+// the alternate-screen buffer; CAVA and terminal output remain visible.
+func (t *terminal) enablePlaybackInput() error {
+	if t.playbackInput {
+		return nil
+	}
+	if t.active {
+		t.restore()
+	}
+	raw := rawTerminal(t.original)
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(t.fd), uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&raw)))
+	if errno != 0 {
+		return errno
+	}
+	t.playbackInput = true
+	fmt.Print("\x1b[0m\x1b[?25h\x1b[2J\x1b[H")
+	return nil
+}
+
+func (t *terminal) restorePlaybackInput() {
+	if !t.playbackInput {
+		return
+	}
+	_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, uintptr(t.fd), uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&t.original)))
+	t.playbackInput = false
+	fmt.Print("\x1b[0m\x1b[?25h")
+}
+
 func (t *terminal) restore() {
+	if t.playbackInput {
+		t.restorePlaybackInput()
+	}
 	if !t.active {
 		return
 	}
@@ -499,9 +542,13 @@ func (a *App) cycleSetting(direction int) {
 		if len(names) == 0 {
 			return
 		}
+		current := a.cfg.Theme
+		if a.provider == "soundcloud" {
+			current = a.cfg.SoundCloudTheme
+		}
 		pos := 0
 		for i, name := range names {
-			if name == a.cfg.Theme {
+			if name == current {
 				pos = i
 				break
 			}
@@ -511,8 +558,13 @@ func (a *App) cycleSetting(direction int) {
 		} else {
 			pos = (pos + len(names) - 1) % len(names)
 		}
-		a.cfg.Theme = names[pos]
-		a.saveConfig("Theme changed to " + a.cfg.Theme + ".")
+		if a.provider == "soundcloud" {
+			a.cfg.SoundCloudTheme = names[pos]
+			a.saveConfig("SoundCloud theme changed to " + a.cfg.SoundCloudTheme + ".")
+		} else {
+			a.cfg.Theme = names[pos]
+			a.saveConfig("Theme changed to " + a.cfg.Theme + ".")
+		}
 	case 3:
 		a.beginInput("sc_client_id")
 	}
@@ -723,21 +775,15 @@ func (a *App) playSelected() {
 		a.notice = "mpv not found. Install mpv to watch videos."
 		return
 	}
-	a.term.restore()
-	fmt.Print("\x1b[0m\x1b[?25h\x1b[2J\x1b[H")
-	fmt.Printf("jabberwock: launching mpv for %s\r\n", video.Title)
-	cmd := exec.Command("mpv", "--", video.WatchURL)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	err := cmd.Run()
-	fmt.Print("\r\nReturning to jabberwock…\r\n")
-	if enableErr := a.term.enable(); enableErr != nil {
-		a.quit = true
-		a.fatalErr = enableErr
-		return
-	}
-	if err != nil {
+	cmd := exec.Command("mpv", "--input-terminal=no", "--", video.WatchURL)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, os.Stdout, os.Stderr
+	stopped, err, _ := a.runManagedPlayback(cmd, nil, "YouTube: "+video.Title)
+	switch {
+	case stopped:
+		a.notice = "Playback stopped. Returned to your results."
+	case err != nil:
 		a.notice = "mpv exited: " + err.Error()
-	} else {
+	default:
 		a.notice = "Playback finished."
 	}
 }
@@ -765,104 +811,202 @@ func (a *App) playSoundCloudTrack(track Video) {
 		return
 	}
 
-	cavaPath, cavaErr := exec.LookPath("cava")
-	a.term.restore()
-	fmt.Print("\x1b[0m\x1b[?25h\x1b[2J\x1b[H")
-	if cavaErr != nil {
-		fmt.Printf("jabberwock: playing SoundCloud audio (install cava for terminal visuals)\r\n\r\n")
-		if err := runPlainSoundCloud(streamURL); err != nil {
-			a.notice = "mpv playback failed: " + err.Error()
-		} else {
-			a.notice = "Playback finished."
-		}
-	} else {
-		fmt.Printf("jabberwock: %s — %s\r\nCAVA will show audio levels; press Ctrl+C to stop playback.\r\n\r\n", track.Title, track.Author)
-		var mpvLog bytes.Buffer
-		mpv := exec.Command("mpv", "--no-video", "--force-window=no", "--no-terminal", "--msg-level=all=warn", "--", streamURL)
-		mpv.Stdin = nil
-		mpv.Stdout, mpv.Stderr = &mpvLog, &mpvLog
-		if err := mpv.Start(); err != nil {
-			a.notice = "Could not start mpv: " + err.Error()
-		} else {
-			mpvDone := make(chan error, 1)
-			go func() { mpvDone <- mpv.Wait() }()
-			select {
-			case playErr := <-mpvDone:
-				// mpv can fail immediately when a stream URL expires or has an
-				// unsupported format. Do not leave CAVA running without audio.
-				if playErr != nil {
-					fmt.Print("mpv could not play this SoundCloud stream:\r\n")
-					if mpvLog.Len() > 0 {
-						fmt.Print(mpvLog.String(), "\r\n")
-					}
-					a.notice = "mpv playback failed: " + playErr.Error()
-				} else {
-					a.notice = "Playback finished."
-				}
-			case <-time.After(350 * time.Millisecond):
-				cava := exec.Command(cavaPath)
-				cava.Stdin, cava.Stdout, cava.Stderr = os.Stdin, os.Stdout, os.Stderr
-				if err := cava.Start(); err != nil {
-					if mpv.Process != nil {
-						_ = mpv.Process.Kill()
-					}
-					<-mpvDone
-					fmt.Printf("CAVA could not start (%v); falling back to plain audio playback.\r\n\r\n", err)
-					if playErr := runPlainSoundCloud(streamURL); playErr != nil {
-						a.notice = "mpv playback failed: " + playErr.Error()
-					} else {
-						a.notice = "Playback finished."
-					}
-				} else {
-					cavaDone := make(chan error, 1)
-					go func() { cavaDone <- cava.Wait() }()
-					select {
-					case playErr := <-mpvDone:
-						if cava.Process != nil {
-							_ = cava.Process.Kill()
-						}
-						<-cavaDone
-						if playErr != nil {
-							fmt.Print("mpv could not play this SoundCloud stream:\r\n")
-							if mpvLog.Len() > 0 {
-								fmt.Print(mpvLog.String(), "\r\n")
-							}
-							a.notice = "mpv playback failed: " + playErr.Error()
-						} else {
-							a.notice = "Playback finished."
-						}
-					case cavaErr := <-cavaDone:
-						if mpv.Process != nil {
-							_ = mpv.Process.Kill()
-						}
-						<-mpvDone
-						if cavaErr != nil {
-							fmt.Printf("\r\nCAVA failed (%v); falling back to plain audio playback.\r\n\r\n", cavaErr)
-							if playErr := runPlainSoundCloud(streamURL); playErr != nil {
-								a.notice = "mpv playback failed: " + playErr.Error()
-							} else {
-								a.notice = "Playback finished."
-							}
-						} else {
-							a.notice = "SoundCloud playback stopped."
-						}
-					}
-				}
-			}
-		}
+	var mpvLog bytes.Buffer
+	mpv := exec.Command("mpv", "--no-video", "--force-window=no", "--no-terminal", "--input-terminal=no", "--msg-level=all=warn", "--", streamURL)
+	mpv.Stdin = nil
+	mpv.Stdout, mpv.Stderr = &mpvLog, &mpvLog
+
+	var cava *exec.Cmd
+	if cavaPath, lookupErr := exec.LookPath("cava"); lookupErr == nil {
+		cava = exec.Command(cavaPath)
+		cava.Stdin, cava.Stdout, cava.Stderr = nil, os.Stdout, os.Stderr
 	}
-	fmt.Print("\r\nReturning to jabberwock…\r\n")
-	if enableErr := a.term.enable(); enableErr != nil {
-		a.quit = true
-		a.fatalErr = enableErr
+	stopped, playErr, visualErr := a.runManagedPlayback(mpv, cava, "SoundCloud: "+track.Title+" — "+track.Author)
+	if stopped {
+		a.notice = "Playback stopped. Returned to your results."
 		return
+	}
+	if playErr != nil {
+		a.notice = "mpv playback failed: " + playErr.Error()
+		if logText := strings.TrimSpace(mpvLog.String()); logText != "" {
+			// Keep the normal TUI intact; a short detail is enough to distinguish
+			// expired streams and decoder failures without leaving CAVA's output up.
+			a.notice += " (" + firstLine(logText) + ")"
+		}
+		return
+	}
+	if visualErr != nil {
+		a.notice = "Playback finished; CAVA stopped: " + visualErr.Error()
+	} else {
+		a.notice = "Playback finished."
 	}
 }
 
-func runPlainSoundCloud(streamURL string) error {
-	cmd := exec.Command("mpv", "--no-video", "--force-window=no", "--", streamURL)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return cmd.Run()
+func firstLine(value string) string {
+	value = strings.TrimSpace(value)
+	if i := strings.IndexAny(value, "\r\n"); i >= 0 {
+		value = value[:i]
+	}
+	if len(value) > 120 {
+		value = value[:117] + "..."
+	}
+	return value
+}
+
+type playbackProcess struct {
+	cmd     *exec.Cmd
+	done    chan error
+	running bool
+	err     error
+}
+
+func startPlaybackProcess(cmd *exec.Cmd) (*playbackProcess, error) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	p := &playbackProcess{cmd: cmd, done: make(chan error, 1), running: true}
+	go func() { p.done <- cmd.Wait() }()
+	return p, nil
+}
+
+func (p *playbackProcess) collectIfDone() bool {
+	if p == nil || !p.running {
+		return false
+	}
+	select {
+	case err := <-p.done:
+		p.running, p.err = false, err
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *playbackProcess) stop() {
+	if p == nil || !p.running || p.cmd == nil || p.cmd.Process == nil {
+		return
+	}
+	// Kill the entire group, not just the top-level command, so mpv helpers and
+	// CAVA are cleaned up when Esc is pressed. Fall back to SIGKILL if needed.
+	_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGTERM)
+	select {
+	case err := <-p.done:
+		p.running, p.err = false, err
+	case <-time.After(700 * time.Millisecond):
+		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+		err := <-p.done
+		p.running, p.err = false, err
+	}
+}
+
+// pollTerminalKey waits briefly for user input without spawning a reader
+// goroutine that could steal a key after playback has ended.
+func pollTerminalKey(timeout time.Duration) (string, bool, error) {
+	fd := int(os.Stdin.Fd())
+	var set syscall.FdSet
+	word, bit := fd/64, uint(fd%64)
+	if word >= len(set.Bits) {
+		return "", false, fmt.Errorf("terminal fd %d is too large for select", fd)
+	}
+	set.Bits[word] |= int64(1) << bit
+	tv := syscall.NsecToTimeval(timeout.Nanoseconds())
+	n, err := syscall.Select(fd+1, &set, nil, nil, &tv)
+	if err != nil {
+		if err == syscall.EINTR {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if n == 0 {
+		return "", false, nil
+	}
+	return readKey(), true, nil
+}
+
+// runManagedPlayback temporarily gives the visible terminal to the player and
+// optional visualizer while retaining raw input in jabberwock. Esc terminates
+// both child process groups and returns to the existing UI state.
+func (a *App) runManagedPlayback(playerCmd, visualCmd *exec.Cmd, title string) (stopped bool, playerErr, visualErr error) {
+	a.term.restore()
+	if err := a.term.enablePlaybackInput(); err != nil {
+		a.notice = "Could not listen for playback controls: " + err.Error()
+		if enableErr := a.term.enable(); enableErr != nil {
+			a.quit, a.fatalErr = true, enableErr
+		}
+		return false, err, nil
+	}
+	fmt.Printf("jabberwock — %s\r\n", title)
+	if visualCmd != nil {
+		fmt.Print("CAVA visuals are enabled. Press Esc to stop playback and return to jabberwock.\r\n\r\n")
+	} else {
+		fmt.Print("Press Esc to stop playback and return to jabberwock.\r\n\r\n")
+	}
+
+	player, err := startPlaybackProcess(playerCmd)
+	if err != nil {
+		playerErr = err
+		fmt.Printf("Could not start mpv: %v\r\n", err)
+		a.finishPlaybackTerminal()
+		return false, playerErr, nil
+	}
+	var visual *playbackProcess
+	if visualCmd != nil {
+		visual, err = startPlaybackProcess(visualCmd)
+		if err != nil {
+			visualErr = err
+			fmt.Printf("CAVA could not start (%v); audio will continue without visuals.\r\n", err)
+			visual = nil
+		}
+	}
+
+	for player.running {
+		player.collectIfDone()
+		if !player.running {
+			break
+		}
+		if visual != nil && visual.collectIfDone() {
+			if visual.err != nil {
+				visualErr = visual.err
+				fmt.Printf("\r\nCAVA stopped (%v); audio will continue.\r\n", visual.err)
+			}
+			visual = nil
+		}
+		key, ready, keyErr := pollTerminalKey(100 * time.Millisecond)
+		if keyErr != nil {
+			// A transient terminal read failure should not tear down the player.
+			continue
+		}
+		if ready && key == "esc" {
+			stopped = true
+			player.stop()
+			if visual != nil {
+				visual.stop()
+			}
+			break
+		}
+	}
+	if !stopped && !player.running {
+		playerErr = player.err
+	}
+	if visual != nil && visual.running {
+		// The player ended (or Esc was pressed); stopping CAVA here is normal
+		// cleanup, not a CAVA failure worth reporting to the user.
+		visual.stop()
+	}
+	a.finishPlaybackTerminal()
+	return stopped, playerErr, visualErr
+}
+
+func (a *App) finishPlaybackTerminal() {
+	a.term.restorePlaybackInput()
+	if enableErr := a.term.enable(); enableErr != nil {
+		a.quit = true
+		a.fatalErr = enableErr
+	}
 }
 
 func (a *App) render() {
@@ -877,7 +1021,7 @@ func (a *App) render() {
 	if height < 12 {
 		height = 12
 	}
-	theme := a.cfg.selectedTheme()
+	theme := a.cfg.selectedThemeFor(a.provider)
 	reset := "\x1b[0m"
 	paint := func(code, text string) string {
 		if code == "" {
@@ -919,10 +1063,13 @@ func (a *App) render() {
 			if a.provider == "soundcloud" {
 				lines = append(lines, "  Welcome to jabberwock SoundCloud mode — search, filter, and play tracks.")
 				lines = append(lines, "  Ctrl+S searches tracks; Enter plays with mpv, optionally alongside CAVA visuals.")
-				lines = append(lines, "  Only playable progressive tracks are listed. Go / subscriber-only and blocked tracks are hidden.")
+				lines = append(lines, "  Press Esc during playback to stop mpv/CAVA and return here.")
+				lines = append(lines, "  SoundCloud uses its orange-accent theme by default; change it in Settings.")
+				lines = append(lines, "  Go / subscriber-only, blocked, and unplayable tracks are hidden.")
 			} else {
 				lines = append(lines, "  Welcome to jabberwock YouTube mode — search, filter, and watch videos.")
 				lines = append(lines, "  Ctrl+S searches; Enter plays a video in mpv. At the end, select Next page.")
+				lines = append(lines, "  Press Esc during playback to stop mpv and return here.")
 			}
 			lines = append(lines, "  Tab switches Home / Filters / Settings; ↑/↓ navigate results and rows inside a section.")
 			lines = append(lines, "  ←/→ change the selected filter or setting. Press Ctrl+P to switch source.")
@@ -1018,10 +1165,14 @@ func (a *App) render() {
 		if a.cfg.SoundCloudClientID != "" {
 			scID = a.cfg.SoundCloudClientID
 		}
+		themeSetting := a.cfg.Theme
+		if a.provider == "soundcloud" {
+			themeSetting = a.cfg.SoundCloudTheme + " (SoundCloud)"
+		}
 		settings := []string{
 			"YouTube backend    " + backend,
 			"Invidious base URL " + a.cfg.InvidiousURL,
-			"Theme              " + a.cfg.Theme,
+			"Theme              " + themeSetting,
 			"SoundCloud client ID " + scID,
 		}
 		for i, setting := range settings {
