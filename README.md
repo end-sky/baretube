@@ -1,6 +1,6 @@
 # jabberwock
 
-A deliberately small, native terminal media client written in Go. It combines **YouTube** and **SoundCloud** search in one TUI, keeps no watch history or local subscriptions, and uses only the Go standard library. Playback is delegated to `mpv`.
+A deliberately small, native terminal media client written in Go. It combines **YouTube** and **SoundCloud** search in one TUI, keeps no watch history or local subscriptions, and uses only the Go standard library. Playback is delegated to `mpv`. if you're looking for the GUi version, [cick here](https://github.com/end-sky/jabberwock#a-non-tui-alternative-if-youre-not-into-that-kind-of-stuff)
 
 ## Build and run
 
