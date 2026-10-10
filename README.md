@@ -97,6 +97,13 @@ The client writes its configuration file only. Search results stay in memory; no
 - `yt/` — YouTube HTML / Invidious search implementation and parser tests
 - `soundcloud/` — SoundCloud client-ID discovery, track search, AAC/HLS transcoding selection and stream resolution, and filters
 
+## A non-tui alternative if you're not into that kind of stuff
+
+https://github.com/end-sky/wisp
+
+Written in C and Go.
+Compile from source.
+
 ## Related projects
 
-The SoundCloud scraper was implemented specifically for jabberwock using Go's standard library. Its design was informed by the public API/streaming approaches described by [soundcloak](https://github.com/maid-zone/soundcloak) and [wisp](https://github.com/end-sky/wisp); their source code was not copied into this project. See each repository for its respective license and implementation details.
+The SoundCloud scraper was implemented specifically for jabberwock using Go's standard library. Its design was informed by the public API/streaming approaches described by [soundcloak](https://github.com/maid-zone/soundcloak) and [wisp](https://github.com/end-sky/wisp); Soundcloak's source code was not copied into this project. See each repository for its respective license and implementation details.
